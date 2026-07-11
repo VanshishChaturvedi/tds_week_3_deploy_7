@@ -1,93 +1,97 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import requests
 import os
 import json
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Dict, Any
+from google import genai
+from google.genai import types
 
 app = FastAPI()
 
-# Pydantic model for the incoming payload
-class SolvePayload(BaseModel):
-    problem_id: str
-    problem: str
+# Rule 4: CORS must be enabled
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.post("/")
-async def process_solve(payload: SolvePayload):
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable not set.")
+# Initialize Gemini Client
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise ValueError("GEMINI_API_KEY environment variable is missing.")
+client = genai.Client(api_key=api_key)
 
-    # Strict adherence to your AI Pipe proxy architecture
-    url = "https://aipipe.org/geminiv1beta/models/gemini-2.5-flash:generateContent"
+# API Spec Input
+class DynamicExtractRequest(BaseModel):
+    text: str
+    # Use an alias because 'schema' is a reserved word in some Pydantic internals
+    schema_def: Dict[str, str] = Field(alias="schema") 
+
+@app.post("/dynamic-extract")
+async def dynamic_extract(payload: DynamicExtractRequest):
+    # 1. Dynamically build the Gemini response schema based on the input dictionary
+    dynamic_properties = {}
+    required_keys = []
     
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
+    for key, field_type in payload.schema_def.items():
+        field_type_lower = field_type.lower()
+        
+        # Map requested types to strict Gemini Types
+        if field_type_lower == "integer":
+            target_type = types.Type.INTEGER
+        elif field_type_lower == "float":
+            target_type = types.Type.NUMBER
+        else:
+            target_type = types.Type.STRING
+            
+        # Add special formatting instructions for dates
+        desc = "Must be in ISO format YYYY-MM-DD." if field_type_lower == "date" else ""
+        
+        dynamic_properties[key] = types.Schema(
+            type=target_type,
+            description=desc,
+            nullable=True # Allows Gemini to return null if missing
+        )
+        required_keys.append(key)
+        
+    # Compile the final schema object
+    runtime_schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties=dynamic_properties,
+        required=required_keys # Forces every requested key to be present in the output
+    )
 
-    # PROMPT ENGINEERING: Adapted from the provided solution to enforce careful arithmetic and ignore distractors
-    prompt = f"""
-    Solve this arithmetic word problem CAREFULLY. It deliberately contains DISTRACTOR numbers that are irrelevant to the final answer.
-    Work in steps:
-    1. List which numbers are relevant and which are distractors.
-    2. Do the arithmetic one operation at a time.
-    3. RE-CHECK the arithmetic a second time before finalising.
-    
-    Return JSON with EXACTLY two keys: 'reasoning' (a string >=80 chars showing your steps) and 'answer' (a JSON integer — not a string, not a float, no currency symbols).
-
-    PROBLEM:
-    {payload.problem}
-    """
-
-    data = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.0, # Zero temperature is critical for math logic
-            "response_mime_type": "application/json"
-        }
-    }
+    # 2. Set strict extraction rules
+    system_instruction = (
+        "You are a strict data extraction API. Extract information from the text exactly matching the provided schema.\n"
+        "RULES:\n"
+        "1. Return exactly the keys requested. No extra keys, no missing keys.\n"
+        "2. If a field's value cannot be definitively found in the text, you MUST set its value to null.\n"
+        "3. Dates must be formatted as YYYY-MM-DD.\n"
+        "4. Integers and floats must be valid JSON numbers, not strings."
+    )
 
     try:
-        response = requests.post(url, headers=headers, json=data)
-        response.raise_for_status()
+        # 3. Execute extraction with the dynamic schema
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=payload.text,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=runtime_schema,
+                system_instruction=system_instruction,
+                temperature=0.0 # Deterministic
+            )
+        )
         
-        response_data = response.json()
-        raw_text = response_data["candidates"][0]["content"]["parts"][0]["text"]
+        # FastAPI will automatically serialize this dict to the final JSON response
+        return json.loads(response.text)
         
-        # Autograder Survival: Strip Markdown backticks completely
-        cleaned_text = raw_text.replace("```json", "").replace("```", "").strip()
-        parsed_json = json.loads(cleaned_text)
-        
-        # POST-PROCESSING: Bulletproof the output shape for the autograder
-        
-        # 1. Enforce strict integer answer (handles if the LLM output "945", 945.0, or "$945")
-        raw_answer = parsed_json.get("answer", 0)
-        try:
-            # Strip currency/commas if the LLM hallucinated a string, then float -> int
-            clean_ans_str = str(raw_answer).replace(",", "").replace("$", "").replace("€", "").replace("£", "")
-            final_answer = int(round(float(clean_ans_str)))
-        except (ValueError, TypeError):
-            final_answer = 0
-            
-        # 2. Enforce reasoning length >= 80 characters
-        reasoning = str(parsed_json.get("reasoning", ""))
-        if len(reasoning) < 80:
-            # Pad the reasoning safely to pass the grader's length check
-            reasoning = (reasoning + " Step-by-step arithmetic reasoning applied; irrelevant distractor values were identified and ignored to reach this conclusion.").strip()
-            
-        # Return exactly the two keys required, no more, no less
-        return {
-            "reasoning": reasoning,
-            "answer": final_answer
-        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"API Request failed: {str(e)}")
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse model response: {str(e)}")
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
